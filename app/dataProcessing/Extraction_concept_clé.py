@@ -1,64 +1,79 @@
-import spacy
+import pymongo
 import re
-from pymongo import MongoClient
-from sklearn.feature_extraction.text import TfidfVectorizer
+import yake
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
 
-# Charger le modèle NLP français de spaCy
-nlp = spacy.load("fr_core_news_md")
+#  modèle pour les embeddings
+sbert_model = SentenceTransformer("allenai-specter")
 
 # Connexion MongoDB
-client = MongoClient("mongodb://localhost:27017/")
-db = client["ProjetSD"]
-
-# Liste des collections (modules)
-modules = ["BaseDonnées", "DevelopementMobile", "java", "Laravel", "Programmation_js", "Programmation_mobile_js", "ProgrammationWeb",
-           "php"]
+client = pymongo.MongoClient("mongodb://localhost:27017")
+db = client["ma_bdd_copie"]
+col = db["documents"]
 
 
-def extract_titles(text):
-    """Détecte les titres et sous-titres en repérant les lignes en majuscules ou longues."""
-    lines = text.split(". ")  # On divise le texte en phrases
-    titles = [line.strip() for line in lines if line.isupper() or len(line) > 50]
-    return titles
+# Nettoyage du texte
+def nettoyer_texte(texte):
+    texte = re.sub(r"\s+", " ", texte)  # Supprime les espaces multiples
+    texte = re.sub(r"[^\w\s]", "", texte)  # Supprime les caractères spéciaux
+    texte = texte.lower()
+    return texte.strip()
 
 
-def extract_keywords(text, num_keywords=10):
-    """Extrait les mots-clés les plus importants avec TF-IDF."""
-    vectorizer = TfidfVectorizer(stop_words="french", max_features=num_keywords)
-    X = vectorizer.fit_transform([text])
-    keywords = vectorizer.get_feature_names_out()
-    return list(keywords)
+# Extraction des concepts avec YAKE
+def extraire_concepts_yake(texte, top_k=30):
+    kw_extractor = yake.KeywordExtractor(lan="fr", top=top_k)
+    keywords = kw_extractor.extract_keywords(texte)
+    return [kw for kw, _ in keywords]
 
 
-def extract_named_entities(text):
-    """Extrait les entités nommées (noms propres, organisations, lieux...) avec spaCy."""
-    doc = nlp(text)
-    entities = {ent.text: ent.label_ for ent in doc.ents}
-    return entities
+# Génération des relations entre concepts
+def generer_graphe_concepts(concepts):
+    if len(concepts) < 2:
+        return []
+
+    embeddings = sbert_model.encode(concepts)
+    sim = cosine_similarity(embeddings)
+
+    G = nx.Graph()
+    for i in range(len(concepts)):
+        for j in range(i + 1, len(concepts)):
+            if sim[i][j] > 0.5:
+                G.add_edge(concepts[i], concepts[j], poids=float(sim[i][j]))
+
+    return [{"source": u, "cible": v, "poids": d["poids"]} for u, v, d in G.edges(data=True)]
 
 
-# Parcourir toutes les collections (modules)
-for module in modules:
-    collection = db[module]
-    documents = collection.find()
-
+# Pipeline principal
+def traiter_documents():
+    documents = list(col.find())
     for doc in documents:
-        text = doc["cleaned_content"]  # Utiliser le texte nettoyé
+        texte_brut = doc.get("texte", "")
+        if not texte_brut.strip():
+            continue
 
-        # Extraction des informations
-        titles = extract_titles(text)
-        keywords = extract_keywords(text)
-        entities = extract_named_entities(text)
+        texte_nettoye = nettoyer_texte(texte_brut)
+        print(f"\n🧹 Texte nettoyé (extrait): {texte_nettoye[:100]}...")  # DEBUG
 
-        # Mise à jour MongoDB
-        collection.update_one(
+        concepts = extraire_concepts_yake(texte_nettoye)
+        print(f"🔍 Concepts extraits (YAKE) : {concepts}")  # DEBUG
+
+        graphe = generer_graphe_concepts(concepts)
+
+        col.update_one(
             {"_id": doc["_id"]},
             {"$set": {
-                "titles": titles,
-                "keywords": keywords,
-                "named_entities": entities
+                "texte_nettoye": texte_nettoye,
+                "mots_cles": concepts,
+                "graphe_concepts": graphe
             }}
         )
-        print(f"✅ Extraction terminée pour {doc['title']} dans {module}")
+        print(f"✅ Document traité : {doc.get('nom', 'Sans nom')}")
 
-print("🚀 Extraction des concepts clés terminée pour tous les modules !")
+
+
+if __name__ == "__main__":
+    traiter_documents()
+
